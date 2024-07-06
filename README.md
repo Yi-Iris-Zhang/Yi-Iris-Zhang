@@ -1,4 +1,4 @@
-## Hi there 👋
+## Notes
 
 A good reflection on this topic would consider the phases that data goes through in its life cycle and how this impacts the data analysis process.
 
