@@ -1,1 +1,282 @@
+import pandas as pd
+import yfinance as yf
+import numpy as np
+from datetime import datetime
+import pandas_datareader.data as web
+import statsmodels.api as sm
+
+def get_sp500_tickers():
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    table = pd.read_html(url)[0]
+    return table['Symbol'].tolist()
+
+def filter_non_financial(tickers):
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    table = pd.read_html(url)[0]
+    non_financial = table[table['GICS Sector'] != 'Financials']
+    non_financial_tickers = set(non_financial['Symbol'].tolist())
+    return [ticker for ticker in tickers if ticker in non_financial_tickers]
+
+def download_data(tickers, start_date, end_date):
+    """下载股票数据"""
+    data = yf.download(tickers, start=start_date, end=end_date)
+    return data['Adj Close']
+
+def calculate_monthly_returns(prices):
+    """计算月度回报"""
+    prices.index = pd.to_datetime(prices.index)
+    return prices.resample('ME').last().pct_change()
+
+def get_book_to_market(tickers):
+    """获取账面市值比数据"""
+    btm = {}
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            book_value = stock.info.get('bookValue', None)
+            market_cap = stock.info.get('marketCap', None)
+            if book_value and market_cap:
+                btm[ticker] = book_value / market_cap
+        except:
+            pass
+    return pd.Series(btm)
+
+def get_ff_factors():
+    ff_factors = web.DataReader('F-F_Research_Data_Factors', 'famafrench', start_date, end_date)
+    ff_factors = ff_factors[0]  # 提取第一个数据集
+    ff_factors = ff_factors / 100  # 转换为百分比
+    return ff_factors
+
+# 设置日期范围
+start_date = datetime(2000, 1, 1)
+end_date = datetime(2023, 12, 31)
+
+# 获取S&P 500成分股
+sp500 = get_sp500_tickers()
+
+# 过滤掉金融公司
+non_financial_sp500 = filter_non_financial(sp500)
+
+# 下载所有非金融股票的数据
+print("Downloading stock data...")
+stock_prices = download_data(non_financial_sp500, start_date, end_date)
+
+# 打印 stock_prices 的信息
+print("Stock prices info:")
+print(stock_prices.info())
+
+# 确保索引是日期类型
+stock_prices.index = pd.to_datetime(stock_prices.index)
+
+print("Calculating monthly returns...")
+stock_returns = calculate_monthly_returns(stock_prices)
+
+print("Getting book-to-market ratios...")
+btm_ratios = get_book_to_market(non_financial_sp500)
+
+print("Stock returns head:")
+print(stock_returns.head())
+print("\nBook-to-market ratios head:")
+print(btm_ratios.head())
+
+# 获取Fama-French因子数据
+print("Downloading Fama-French factors...")
+ff_factors = get_ff_factors()
+
+print("Fama-French factors head:")
+print(ff_factors.head())
+
+# 确保日期对齐
+stock_returns = stock_returns.loc[start_date:end_date]
+ff_factors = ff_factors.loc[start_date:end_date]
+
+def get_shares_outstanding(non_financial_sp500):
+    shares = {}
+    for ticker in non_financial_sp500:
+        try:
+            stock = yf.Ticker(ticker)
+            shares[ticker] = stock.info['sharesOutstanding']
+        except:
+            print(f"Could not get shares outstanding for {ticker}")
+    return pd.Series(shares)
+
+shares_outstanding = get_shares_outstanding(non_financial_sp500)
+
+# 确保 stock_prices 和 shares_outstanding 的索引匹配
+shares_outstanding = shares_outstanding.reindex(stock_prices.columns)
+
+# 计算市值
+market_caps = stock_prices.mul(shares_outstanding, axis=1)
+monthly_market_caps = market_caps.resample('M').last()
+
+def get_book_to_market(non_financial_sp500):
+    btm_ratios = {}
+    failed_tickers = []
+    for ticker in non_financial_sp500:
+        try:
+            stock = yf.Ticker(ticker)
+            book_value = stock.info['bookValue']
+            market_cap = stock.info['marketCap']
+            if market_cap > 0:
+                btm_ratios[ticker] = book_value / market_cap
+            else:
+                failed_tickers.append(ticker)
+        except:
+            failed_tickers.append(ticker)
+    
+    print(f"Failed to get data for {len(failed_tickers)} tickers: {failed_tickers}")
+    return pd.Series(btm_ratios)
+
+btm_ratios = get_book_to_market(non_financial_sp500)
+# 获取所有数据集中共同的股票
+common_stocks = btm_ratios.index.intersection(stock_returns.columns).intersection(monthly_market_caps.columns)
+
+# 过滤数据集
+btm_ratios = btm_ratios[common_stocks]
+stock_returns = stock_returns[common_stocks]
+monthly_market_caps = monthly_market_caps[common_stocks]
+
+print(f"Number of stocks with all data available: {len(common_stocks)}")
+
+import pandas as pd
+import numpy as np
+
+def construct_portfolios_2x3(returns, market_caps, btm_ratios):
+    portfolios = {}
+    
+    for date in returns.index:
+        current_returns = returns.loc[date]
+        current_caps = market_caps.loc[date]
+        
+        # 使用中位数划分规模
+        size_median = current_caps.median()
+        small = current_caps <= size_median
+        big = current_caps > size_median
+        
+        # 使用30%和70%分位点划分BE/ME
+        btm_breakpoints = btm_ratios.quantile([0.3, 0.7])
+        value = btm_ratios > btm_breakpoints.iloc[1]
+        neutral = (btm_ratios >= btm_breakpoints.iloc[0]) & (btm_ratios <= btm_breakpoints.iloc[1])
+        growth = btm_ratios < btm_breakpoints.iloc[0]
+        
+        # 构建6个投资组合
+        portfolios_dict = {
+            'Small Value': current_returns[small & value],
+            'Small Neutral': current_returns[small & neutral],
+            'Small Growth': current_returns[small & growth],
+            'Big Value': current_returns[big & value],
+            'Big Neutral': current_returns[big & neutral],
+            'Big Growth': current_returns[big & growth]
+        }
+        
+        for name, portfolio in portfolios_dict.items():
+            if name not in portfolios:
+                portfolios[name] = pd.Series(dtype=float)
+            portfolios[name][date] = portfolio.mean()
+    
+    return pd.DataFrame(portfolios)
+
+# 假设 monthly_returns, monthly_market_caps, btm_ratios 是已经存在的 DataFrame
+portfolio_returns = construct_portfolios_2x3(stock_returns, monthly_market_caps, btm_ratios)
+
+print("\nPortfolio Returns:")
+portfolio_returns
+
+
+def construct_factors(stock_returns, monthly_returns):
+    # SMB factor
+    small = stock_returns[['Small Value', 'Small Neutral', 'Small Growth']].mean(axis=1)
+    big = stock_returns[['Big Value', 'Big Neutral', 'Big Growth']].mean(axis=1)
+    smb = small - big
+    
+    # HML factor
+    value = stock_returns[['Small Value', 'Big Value']].mean(axis=1)
+    growth = stock_returns[['Small Growth', 'Big Growth']].mean(axis=1)
+    hml = value - growth
+    
+    # 市场因子 (这里我们使用所有股票的平均收益作为简单的代理)
+    market = stock_returns.mean(axis=1)
+    rf = 0.01 / 12  # 月无风险利率假设为0.01年化
+    
+    return pd.DataFrame({'Mkt-RF': market - rf, 'SMB': smb, 'HML': hml})
+
+factors = construct_factors(portfolio_returns, stock_returns)
+
+print("\nFactors:")
+factors
+
+
+import pandas as pd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# 确保日期是 datetime 格式
+portfolio_returns.index = pd.to_datetime(portfolio_returns.index)
+factors.index = pd.to_datetime(factors.index)
+
+# 对齐数据，只保留两者都有的日期
+common_dates = portfolio_returns.index.intersection(factors.index)
+portfolio_returns = portfolio_returns.loc[common_dates]
+factors = factors.loc[common_dates]
+
+# 确保所有需要的列都存在
+required_columns = ['Small Value', 'Small Neutral', 'Small Growth', 'Big Value', 'Big Neutral', 'Big Growth']
+
+# 检查缺失列并移除缺失值的日期
+valid_dates = portfolio_returns.dropna(subset=required_columns).index
+portfolio_returns = portfolio_returns.loc[valid_dates]
+factors = factors.loc[valid_dates]
+
+# 合并数据
+data = pd.concat([portfolio_returns, factors], axis=1)
+
+# 存储回归结果
+results = []
+
+# 对每个日期进行分组回归
+for date, group in data.groupby(data.index):
+    try:
+        # 自变量
+        X = group[['Mkt-RF', 'SMB', 'HML']]
+        X = sm.add_constant(X)
+        
+        # 因变量
+        for portfolio in required_columns:
+            y = group[portfolio]
+            
+            if y.isnull().any() or X.isnull().any().any():
+                continue
+            
+            # 运行回归分析
+            model = sm.OLS(y, X).fit()
+            result = {
+                'Date': date,
+                'Portfolio': portfolio,
+                'const': model.params.get('const', float('nan')),
+                'Mkt-RF': model.params.get('Mkt-RF', float('nan')),
+                'SMB': model.params.get('SMB', float('nan')),
+                'HML': model.params.get('HML', float('nan'))
+            }
+            results.append(result)
+    
+    except Exception as e:
+        print(f"Error processing date {date}: {e}")
+
+# 转换结果为 DataFrame
+results_df = pd.DataFrame(results)
+
+# 打印结果统计信息
+if not results_df.empty:
+    print(results_df.describe())
+
+    # 绘制回归系数随时间变化的折线图
+    for portfolio in required_columns:
+        portfolio_results = results_df[results_df['Portfolio'] == portfolio]
+        portfolio_results.set_index('Date', inplace=True)
+        
+        portfolio_results[['const', 'Mkt-RF', 'SMB', 'HML']].plot(subplots=True, layout=(2, 2), figsize=(12, 8), title=f"Regression Coefficients for {portfolio} Over Time")
+        plt.tight_layout()
+        plt.show()
+else:
+    print("No valid regression results found.")
 
